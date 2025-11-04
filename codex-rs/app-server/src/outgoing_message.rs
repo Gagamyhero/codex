@@ -141,6 +141,7 @@ pub(crate) struct OutgoingError {
 
 #[cfg(test)]
 mod tests {
+    use codex_app_server_protocol::AccountLoginCompletedNotification;
     use codex_app_server_protocol::AccountUpdatedNotification;
     use codex_app_server_protocol::AuthMode;
     use codex_app_server_protocol::LoginChatGptCompleteNotification;
@@ -174,6 +175,31 @@ mod tests {
             serde_json::to_value(jsonrpc_notification)
                 .expect("ensure the strum macros serialize the method field correctly"),
             "ensure the strum macros serialize the method field correctly"
+        );
+    }
+
+    #[test]
+    fn verify_account_login_completed_notification_serialization() {
+        let notification =
+            ServerNotification::AccountLoginCompleted(AccountLoginCompletedNotification {
+                login_id: Uuid::nil(),
+                success: true,
+                error: None,
+            });
+
+        let jsonrpc_notification = OutgoingMessage::AppServerNotification(notification);
+        assert_eq!(
+            json!({
+                "method": "account/login/completed",
+                "params": {
+                    "loginId": Uuid::nil(),
+                    "success": true,
+                    "error": null,
+                },
+            }),
+            serde_json::to_value(jsonrpc_notification)
+                .expect("ensure the notification serializes correctly"),
+            "ensure the notification serializes correctly"
         );
     }
 

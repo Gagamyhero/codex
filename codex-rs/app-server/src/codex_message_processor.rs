@@ -4,6 +4,7 @@ use crate::fuzzy_file_search::run_fuzzy_file_search;
 use crate::models::supported_models;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::OutgoingNotification;
+use codex_app_server_protocol::AccountLoginCompletedNotification;
 use codex_app_server_protocol::AccountUpdatedNotification;
 use codex_app_server_protocol::AddConversationListenerParams;
 use codex_app_server_protocol::AddConversationSubscriptionResponse;
@@ -362,20 +363,21 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn login_chatgpt_common(&mut self, request_id: RequestId) {
+    // Build options for a ChatGPT login attempt; performs validation.
+    async fn login_chatgpt_common(
+        &self,
+    ) -> std::result::Result<LoginServerOptions, JSONRPCErrorError> {
         let config = self.config.as_ref();
 
         if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
-            let error = JSONRPCErrorError {
+            return Err(JSONRPCErrorError {
                 code: INVALID_REQUEST_ERROR_CODE,
                 message: "ChatGPT login is disabled. Use API key login instead.".to_string(),
                 data: None,
-            };
-            self.outgoing.send_error(request_id, error).await;
-            return;
+            });
         }
 
-        let opts = LoginServerOptions {
+        Ok(LoginServerOptions {
             open_browser: false,
             ..LoginServerOptions::new(
                 config.codex_home.clone(),
@@ -383,108 +385,191 @@ impl CodexMessageProcessor {
                 config.forced_chatgpt_workspace_id.clone(),
                 config.cli_auth_credentials_store_mode,
             )
-        };
-
-        enum LoginChatGptReply {
-            Response(LoginChatGptResponse),
-            Error(JSONRPCErrorError),
-        }
-
-        let reply = match run_login_server(opts) {
-            Ok(server) => {
-                let login_id = Uuid::new_v4();
-                let shutdown_handle = server.cancel_handle();
-
-                // Replace active login if present.
-                {
-                    let mut guard = self.active_login.lock().await;
-                    if let Some(existing) = guard.take() {
-                        existing.drop();
-                    }
-                    *guard = Some(ActiveLogin {
-                        shutdown_handle: shutdown_handle.clone(),
-                        login_id,
-                    });
-                }
-
-                let response = LoginChatGptResponse {
-                    login_id,
-                    auth_url: server.auth_url.clone(),
-                };
-
-                // Spawn background task to monitor completion.
-                let outgoing_clone = self.outgoing.clone();
-                let active_login = self.active_login.clone();
-                let auth_manager = self.auth_manager.clone();
-                tokio::spawn(async move {
-                    let (success, error_msg) = match tokio::time::timeout(
-                        LOGIN_CHATGPT_TIMEOUT,
-                        server.block_until_done(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => (true, None),
-                        Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
-                        Err(_elapsed) => {
-                            // Timeout: cancel server and report
-                            shutdown_handle.shutdown();
-                            (false, Some("Login timed out".to_string()))
-                        }
-                    };
-                    let payload = LoginChatGptCompleteNotification {
-                        login_id,
-                        success,
-                        error: error_msg,
-                    };
-                    outgoing_clone
-                        .send_server_notification(ServerNotification::LoginChatGptComplete(payload))
-                        .await;
-
-                    // Send an auth status change notification.
-                    if success {
-                        // Update in-memory auth cache now that login completed.
-                        auth_manager.reload();
-
-                        // Notify clients with the actual current auth mode.
-                        let current_auth_method = auth_manager.auth().map(|a| a.mode);
-                        let payload = AuthStatusChangeNotification {
-                            auth_method: current_auth_method,
-                        };
-                        outgoing_clone
-                            .send_server_notification(ServerNotification::AuthStatusChange(payload))
-                            .await;
-                    }
-
-                    // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
-                    let mut guard = active_login.lock().await;
-                    if guard.as_ref().map(|l| l.login_id) == Some(login_id) {
-                        *guard = None;
-                    }
-                });
-
-                LoginChatGptReply::Response(response)
-            }
-            Err(err) => LoginChatGptReply::Error(JSONRPCErrorError {
-                code: INTERNAL_ERROR_CODE,
-                message: format!("failed to start login server: {err}"),
-                data: None,
-            }),
-        };
-
-        match reply {
-            LoginChatGptReply::Response(resp) => {
-                self.outgoing.send_response(request_id, resp).await
-            }
-            LoginChatGptReply::Error(err) => self.outgoing.send_error(request_id, err).await,
-        }
+        })
     }
 
+    // Deprecated in favor of login_chatgpt_v2.
     async fn login_chatgpt_v1(&mut self, request_id: RequestId) {
-        self.login_chatgpt_common(request_id).await
+        match self.login_chatgpt_common().await {
+            Ok(opts) => match run_login_server(opts) {
+                Ok(server) => {
+                    let login_id = Uuid::new_v4();
+                    let shutdown_handle = server.cancel_handle();
+
+                    // Replace active login if present.
+                    {
+                        let mut guard = self.active_login.lock().await;
+                        if let Some(existing) = guard.take() {
+                            existing.drop();
+                        }
+                        *guard = Some(ActiveLogin {
+                            shutdown_handle: shutdown_handle.clone(),
+                            login_id,
+                        });
+                    }
+
+                    // Spawn background task to monitor completion.
+                    let outgoing_clone = self.outgoing.clone();
+                    let active_login = self.active_login.clone();
+                    let auth_manager = self.auth_manager.clone();
+                    let auth_url = server.auth_url.clone();
+                    tokio::spawn(async move {
+                        let (success, error_msg) = match tokio::time::timeout(
+                            LOGIN_CHATGPT_TIMEOUT,
+                            server.block_until_done(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => (true, None),
+                            Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
+                            Err(_elapsed) => {
+                                shutdown_handle.shutdown();
+                                (false, Some("Login timed out".to_string()))
+                            }
+                        };
+
+                        let payload = LoginChatGptCompleteNotification {
+                            login_id,
+                            success,
+                            error: error_msg.clone(),
+                        };
+                        outgoing_clone
+                            .send_server_notification(ServerNotification::LoginChatGptComplete(
+                                payload,
+                            ))
+                            .await;
+
+                        if success {
+                            auth_manager.reload();
+
+                            // Notify clients with the actual current auth mode.
+                            let current_auth_method = auth_manager.auth().map(|a| a.mode);
+                            let payload = AuthStatusChangeNotification {
+                                auth_method: current_auth_method,
+                            };
+                            outgoing_clone
+                                .send_server_notification(ServerNotification::AuthStatusChange(
+                                    payload,
+                                ))
+                                .await;
+                        }
+
+                        // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
+                        let mut guard = active_login.lock().await;
+                        if guard.as_ref().map(|l| l.login_id) == Some(login_id) {
+                            *guard = None;
+                        }
+                    });
+
+                    let response = LoginChatGptResponse { login_id, auth_url };
+                    self.outgoing.send_response(request_id, response).await;
+                }
+                Err(err) => {
+                    let error = JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to start login server: {err}"),
+                        data: None,
+                    };
+                    self.outgoing.send_error(request_id, error).await;
+                }
+            },
+            Err(err) => {
+                self.outgoing.send_error(request_id, err).await;
+            }
+        }
     }
 
     async fn login_chatgpt_v2(&mut self, request_id: RequestId) {
-        self.login_chatgpt_common(request_id).await
+        match self.login_chatgpt_common().await {
+            Ok(opts) => match run_login_server(opts) {
+                Ok(server) => {
+                    let login_id = Uuid::new_v4();
+                    let shutdown_handle = server.cancel_handle();
+
+                    // Replace active login if present.
+                    {
+                        let mut guard = self.active_login.lock().await;
+                        if let Some(existing) = guard.take() {
+                            existing.drop();
+                        }
+                        *guard = Some(ActiveLogin {
+                            shutdown_handle: shutdown_handle.clone(),
+                            login_id,
+                        });
+                    }
+
+                    // Spawn background task to monitor completion.
+                    let outgoing_clone = self.outgoing.clone();
+                    let active_login = self.active_login.clone();
+                    let auth_manager = self.auth_manager.clone();
+                    let auth_url = server.auth_url.clone();
+                    tokio::spawn(async move {
+                        let (success, error_msg) = match tokio::time::timeout(
+                            LOGIN_CHATGPT_TIMEOUT,
+                            server.block_until_done(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => (true, None),
+                            Ok(Err(err)) => (false, Some(format!("Login server error: {err}"))),
+                            Err(_elapsed) => {
+                                shutdown_handle.shutdown();
+                                (false, Some("Login timed out".to_string()))
+                            }
+                        };
+
+                        let payload_v2 = AccountLoginCompletedNotification {
+                            login_id,
+                            success,
+                            error: error_msg,
+                        };
+                        outgoing_clone
+                            .send_server_notification(ServerNotification::AccountLoginCompleted(
+                                payload_v2,
+                            ))
+                            .await;
+
+                        if success {
+                            auth_manager.reload();
+
+                            // Notify clients with the actual current auth mode.
+                            let current_auth_method = auth_manager.auth().map(|a| a.mode);
+                            let payload_v2 = AccountUpdatedNotification {
+                                auth_method: current_auth_method,
+                            };
+                            outgoing_clone
+                                .send_server_notification(ServerNotification::AccountUpdated(
+                                    payload_v2,
+                                ))
+                                .await;
+                        }
+
+                        // Clear the active login if it matches this attempt. It may have been replaced or cancelled.
+                        let mut guard = active_login.lock().await;
+                        if guard.as_ref().map(|l| l.login_id) == Some(login_id) {
+                            *guard = None;
+                        }
+                    });
+
+                    let response = codex_app_server_protocol::LoginAccountResponse {
+                        login_id: Some(login_id),
+                        auth_url: Some(auth_url),
+                    };
+                    self.outgoing.send_response(request_id, response).await;
+                }
+                Err(err) => {
+                    let error = JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to start login server: {err}"),
+                        data: None,
+                    };
+                    self.outgoing.send_error(request_id, error).await;
+                }
+            },
+            Err(err) => {
+                self.outgoing.send_error(request_id, err).await;
+            }
+        }
     }
 
     async fn cancel_login_chatgpt(&mut self, request_id: RequestId, login_id: Uuid) {
