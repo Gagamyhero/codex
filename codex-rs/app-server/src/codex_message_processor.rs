@@ -35,6 +35,7 @@ use codex_app_server_protocol::ListConversationsParams;
 use codex_app_server_protocol::ListConversationsResponse;
 use codex_app_server_protocol::ListModelsParams;
 use codex_app_server_protocol::ListModelsResponse;
+use codex_app_server_protocol::LoginAccountParams;
 use codex_app_server_protocol::LoginApiKeyParams;
 use codex_app_server_protocol::LoginApiKeyResponse;
 use codex_app_server_protocol::LoginChatGptCompleteNotification;
@@ -190,12 +191,8 @@ impl CodexMessageProcessor {
             ClientRequest::ListModels { request_id, params } => {
                 self.list_models(request_id, params).await;
             }
-            ClientRequest::LoginAccount {
-                request_id,
-                params: _,
-            } => {
-                self.send_unimplemented_error(request_id, "account/login")
-                    .await;
+            ClientRequest::LoginAccount { request_id, params } => {
+                self.login_v2(request_id, params).await;
             }
             ClientRequest::LogoutAccount {
                 request_id,
@@ -241,7 +238,7 @@ impl CodexMessageProcessor {
                 request_id,
                 params: _,
             } => {
-                self.login_chatgpt(request_id).await;
+                self.login_chatgpt_v1(request_id).await;
             }
             ClientRequest::CancelLoginChatGpt { request_id, params } => {
                 self.cancel_login_chatgpt(request_id, params.login_id).await;
@@ -303,6 +300,18 @@ impl CodexMessageProcessor {
         self.outgoing.send_error(request_id, error).await;
     }
 
+    async fn login_v2(&mut self, request_id: RequestId, params: LoginAccountParams) {
+        match params {
+            LoginAccountParams::ApiKey { api_key } => {
+                self.login_api_key(request_id, LoginApiKeyParams { api_key })
+                    .await;
+            }
+            LoginAccountParams::ChatGpt => {
+                self.login_chatgpt_v2(request_id).await;
+            }
+        }
+    }
+
     async fn login_api_key(&mut self, request_id: RequestId, params: LoginApiKeyParams) {
         if matches!(
             self.config.forced_login_method,
@@ -353,7 +362,7 @@ impl CodexMessageProcessor {
         }
     }
 
-    async fn login_chatgpt(&mut self, request_id: RequestId) {
+    async fn login_chatgpt_common(&mut self, request_id: RequestId) {
         let config = self.config.as_ref();
 
         if matches!(config.forced_login_method, Some(ForcedLoginMethod::Api)) {
@@ -468,6 +477,14 @@ impl CodexMessageProcessor {
             }
             LoginChatGptReply::Error(err) => self.outgoing.send_error(request_id, err).await,
         }
+    }
+
+    async fn login_chatgpt_v1(&mut self, request_id: RequestId) {
+        self.login_chatgpt_common(request_id).await
+    }
+
+    async fn login_chatgpt_v2(&mut self, request_id: RequestId) {
+        self.login_chatgpt_common(request_id).await
     }
 
     async fn cancel_login_chatgpt(&mut self, request_id: RequestId, login_id: Uuid) {
